@@ -1,4 +1,7 @@
+import 'dart:io' show Platform;
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
@@ -145,12 +148,24 @@ class _CaptureTabState extends State<_CaptureTab> {
     setState(() => _picking = true);
     ImageSource? nextSource;
     try {
-      if (source == ImageSource.gallery && !await _ensureFullPhotoAccess(context)) {
+      if (source == ImageSource.gallery && !await _ensureGalleryAccess(context)) {
         return;
       }
 
       final picker = ImagePicker();
-      final picked = await picker.pickImage(source: source, imageQuality: 95);
+      XFile? picked;
+      try {
+        picked = await picker.pickImage(source: source, imageQuality: 95);
+      } on PlatformException {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Não foi possível abrir a galeria. Verifique as permissões nas Configurações.'),
+            ),
+          );
+        }
+        return;
+      }
       if (picked == null || !context.mounted) return;
 
       final bytes = await picked.readAsBytes();
@@ -168,15 +183,20 @@ class _CaptureTabState extends State<_CaptureTab> {
     } finally {
       if (mounted) setState(() => _picking = false);
     }
-    // _picking já é false aqui — seguro para reabrir
     if (nextSource != null && context.mounted) {
       _pickImage(context, nextSource);
     }
   }
 
-  /// Returns true if full gallery access is available.
-  /// If limited, shows a dialog offering to open Settings.
-  Future<bool> _ensureFullPhotoAccess(BuildContext context) async {
+  Future<bool> _ensureGalleryAccess(BuildContext context) async {
+    if (Platform.isIOS) {
+      return _ensureIOSPhotoAccess(context);
+    }
+    return _ensureAndroidGalleryAccess(context);
+  }
+
+  // iOS: distingue acesso total, parcial (Limited) e negado.
+  Future<bool> _ensureIOSPhotoAccess(BuildContext context) async {
     final status = await Permission.photos.status;
 
     if (status.isGranted) return true;
@@ -218,6 +238,33 @@ class _CaptureTabState extends State<_CaptureTab> {
 
     // permanentlyDenied
     if (!context.mounted) return false;
+    await _showPermanentlyDeniedDialog(context);
+    return false;
+  }
+
+  // Android: API < 33 usa READ_EXTERNAL_STORAGE; 33+ usa READ_MEDIA_IMAGES;
+  // 34+ também aceita READ_MEDIA_VISUAL_USER_SELECTED (acesso parcial = isLimited).
+  Future<bool> _ensureAndroidGalleryAccess(BuildContext context) async {
+    final status = await Permission.photos.status;
+
+    // granted ou limited (acesso parcial no Android 14+) — tudo certo
+    if (status.isGranted || status.isLimited) return true;
+
+    if (status.isDenied) {
+      final result = await Permission.photos.request();
+      if (result.isGranted || result.isLimited) return true;
+      // Se ainda negado, tenta abrir a galeria mesmo assim — alguns OEMs
+      // gerenciam permissões de forma independente do sistema padrão.
+      return true;
+    }
+
+    // permanentlyDenied
+    if (!context.mounted) return false;
+    await _showPermanentlyDeniedDialog(context);
+    return false;
+  }
+
+  Future<void> _showPermanentlyDeniedDialog(BuildContext context) async {
     await showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -242,7 +289,6 @@ class _CaptureTabState extends State<_CaptureTab> {
         ],
       ),
     );
-    return false;
   }
 }
 
